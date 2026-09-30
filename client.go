@@ -83,6 +83,10 @@ type Client struct {
 	Stats        *StatsResource
 	Webhooks     *WebhooksResource
 	Admin        *AdminResource
+
+	// API has every feature route, one method each (generated from the API
+	// spec: api_generated.go), signed like every other call.
+	API *GeneratedAPI
 }
 
 // NewClient constructs a Fulkruma client. Returns *Error when required
@@ -145,6 +149,7 @@ func NewClient(opts ClientOptions) (*Client, error) {
 	c.Stats = &StatsResource{c: c}
 	c.Webhooks = &WebhooksResource{c: c}
 	c.Admin = &AdminResource{c: c}
+	c.API = &GeneratedAPI{c: c}
 	return c, nil
 }
 
@@ -183,7 +188,8 @@ type RequestOptions struct {
 //
 // `body` is JSON-marshaled (compact, the Go default) before signing. The
 // raw bytes that get signed are exactly the bytes that get sent over the
-// wire — same invariant the backend enforces.
+// wire, which the backend verifies. An empty body ({}, [] or null) is sent
+// as no body at all, and signed as the empty string.
 func (c *Client) Request(ctx context.Context, method, path string, body any, out any, opts *RequestOptions) error {
 	var bodyBytes []byte
 	if body != nil {
@@ -191,6 +197,9 @@ func (c *Client) Request(ctx context.Context, method, path string, body any, out
 		bodyBytes, err = json.Marshal(body)
 		if err != nil {
 			return newErr(0, "serialize_failed", err.Error())
+		}
+		if s := string(bodyBytes); s == "{}" || s == "[]" || s == "null" {
+			bodyBytes = nil
 		}
 	}
 
@@ -281,6 +290,31 @@ func (c *Client) Request(ctx context.Context, method, path string, body any, out
 		}
 	}
 	return nil
+}
+
+// apigenRequest is the call behind Client.API (api_generated.go): signed
+// like every other request (the path with its query, as the server reads
+// req.originalUrl), with an idempotency key on writes. An empty body is not
+// sent: the server hashes an empty JSON body as "" (backend
+// middleware/hmac-auth.ts) while Request would hash "{}", and the
+// signatures would not agree.
+func (c *Client) apigenRequest(ctx context.Context, method, path string, query url.Values, body map[string]any) (json.RawMessage, error) {
+	if len(query) > 0 {
+		path += "?" + query.Encode()
+	}
+	var send any
+	if len(body) > 0 {
+		send = body
+	}
+	var opts *RequestOptions
+	if strings.ToUpper(method) != http.MethodGet {
+		opts = &RequestOptions{IdempotencyKey: c.genIdem()}
+	}
+	var out json.RawMessage
+	if err := c.Request(ctx, method, path, send, &out, opts); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // sign returns the hex-encoded HMAC-SHA256 over the canonical signing
